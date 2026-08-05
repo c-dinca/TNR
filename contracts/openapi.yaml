@@ -1,0 +1,1111 @@
+openapi: 3.1.0
+
+# NORMATIVE. This file is the source of truth for the HTTP API surface.
+# Conventions and rationale: docs/02-architecture/03-api-design.md
+#
+# Rules:
+#   * additive changes only within v1 — offline clients may be months old
+#   * all errors are RFC 9457 application/problem+json
+#   * all coordinates are GeoJSON [longitude, latitude] — LONGITUDE FIRST
+#   * org_id is NEVER accepted in a request body; it comes from the session
+#
+# This spec covers M0–M2 (foundation, identity, field capture). Endpoints for
+# missions (M3), interventions and reporting (M4) are declared under
+# `x-planned-endpoints` at the bottom and must be specified by their backlog
+# items before implementation.
+
+info:
+  title: TNR-OS API
+  version: "1.0.0"
+  description: |
+    Geospatial command and fleet-logistics API for Trap-Neuter-Return campaigns.
+    See docs/README.md in the repository for the full specification.
+  license:
+    name: TBD
+    identifier: NOASSERTION
+
+servers:
+  - url: https://api.tnr-os.dev/v1
+    description: Production
+  - url: https://api.staging.tnr-os.dev/v1
+    description: Staging
+  - url: http://localhost:3000/v1
+    description: Local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+  - name: orgs
+  - name: sightings
+  - name: packs
+  - name: animals
+  - name: media
+  - name: sync
+  - name: audit
+  - name: jobs
+
+paths:
+  # ---------------------------------------------------------------- auth ----
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Register a user, create an org, become its owner
+      description: Satisfies FR-001, FR-002, FR-010. Creates all three atomically.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Authenticate
+      description: |
+        FR-003, FR-005, FR-008. Never discloses whether an email is registered:
+        an unknown email and a wrong password produce the same response.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate the refresh token
+      description: |
+        FR-004. Rotation is mandatory. Presenting an already-used token revokes
+        the entire token family and writes an audit event.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Rotated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the presented refresh token
+      responses:
+        '204': { description: Revoked }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current user, memberships, active org and effective permissions
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurrentUser' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /auth/switch-org:
+    post:
+      tags: [auth]
+      summary: Mint an access token scoped to another org
+      description: FR-009. The refresh token is org-independent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org_id]
+              properties:
+                org_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /auth/sessions:
+    get:
+      tags: [auth]
+      summary: List the caller's own sessions
+      description: FR-019.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Session' }
+
+  /auth/sessions/{sessionId}:
+    delete:
+      tags: [auth]
+      summary: Revoke one session
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204': { description: Revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ sightings ----
+  /sightings:
+    get:
+      tags: [sightings]
+      summary: List sightings
+      description: |
+        FR-037, FR-038. Cursor-paginated. Spatially filtered results switch to a
+        clustered representation above the feature cap; clients MUST handle both.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Bbox'
+        - name: occurred_after
+          in: query
+          schema: { type: string, format: date-time }
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, duplicate, rejected] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SightingList' }
+    post:
+      tags: [sightings]
+      summary: Create a sighting
+      description: |
+        FR-020, FR-021, FR-024, FR-035. The client supplies the UUIDv7 `id`
+        (ADR-0015). Creating with an existing id and an identical payload is a
+        replay and returns 200 with the existing resource.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SightingCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sighting' }
+        '200':
+          description: Replay of an already-created resource
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sighting' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /sightings/{id}:
+    get:
+      tags: [sightings]
+      summary: Read a sighting
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sighting' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- packs ----
+  /packs:
+    get:
+      tags: [packs]
+      summary: List packs
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Bbox'
+        - name: status
+          in: query
+          schema: { type: string, enum: [proposed, active, closed] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PackList' }
+
+  /packs/{id}:
+    get:
+      tags: [packs]
+      summary: Read a pack
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [packs]
+      summary: Update pack metadata
+      description: Optimistic concurrency via `version`; a mismatch returns 409.
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PackUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /packs/{id}/merge:
+    post:
+      tags: [packs]
+      summary: Merge other packs into this one
+      description: |
+        FR-043. Audited with every affected sighting id. Merged packs are retained
+        forever with status closed/duplicate, never deleted.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_pack_ids]
+              properties:
+                source_pack_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Merged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /packs/{id}/split:
+    post:
+      tags: [packs]
+      summary: Split sightings out into a new pack
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sighting_ids]
+              properties:
+                sighting_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: uuid }
+                new_pack_name: { type: string }
+      responses:
+        '201':
+          description: Split
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+
+  /packs/{id}/close:
+    post:
+      tags: [packs]
+      summary: Close a pack
+      description: FR-044. A reason from the fixed set is required.
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  enum: [resolved, relocated, duplicate, erroneous]
+      responses:
+        '200':
+          description: Closed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+
+  /packs/{id}/confirm:
+    post:
+      tags: [packs]
+      summary: Confirm a proposed pack
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200':
+          description: Confirmed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Pack' }
+
+  # -------------------------------------------------------------- animals ----
+  /animals:
+    get:
+      tags: [animals]
+      summary: List animals
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: microchip
+          in: query
+          schema: { type: string, pattern: '^[0-9]{15}$' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnimalList' }
+    post:
+      tags: [animals]
+      summary: Create an animal
+      description: |
+        FR-050 to FR-052. A microchip must be 15 numeric digits. Non-642 prefixes
+        are valid (a foreign-registered animal) and are flagged, not rejected.
+        A conflicting chip returns 409 referencing the existing animal.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnimalCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Animal' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- media ----
+  /media/presign:
+    get:
+      tags: [media]
+      summary: Get a short-lived direct upload URL
+      description: |
+        FR-060, FR-061. Bytes never transit the API. The declared hash and size
+        are required here so that finalisation can verify what was actually stored.
+      parameters:
+        - name: content_type
+          in: query
+          required: true
+          schema: { type: string, enum: [image/jpeg, image/png, image/webp, image/heic] }
+        - name: byte_size
+          in: query
+          required: true
+          schema: { type: integer, maximum: 8388608 }
+        - name: sha256
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaPresign' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /media/{id}/finalise:
+    post:
+      tags: [media]
+      summary: Finalise an upload
+      description: |
+        Server computes SHA-256 over the stored object and compares it with the
+        declared hash. A mismatch quarantines the object and raises a security alert.
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200':
+          description: Finalised
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /media/{id}/link:
+    post:
+      tags: [media]
+      summary: Attach media to a domain entity
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entity_type, entity_id]
+              properties:
+                entity_type:
+                  type: string
+                  enum: [sighting, intervention, animal, pack]
+                entity_id: { type: string, format: uuid }
+                role:
+                  type: string
+                  enum: [general, before, after, evidence]
+                  default: general
+      responses:
+        '201': { description: Linked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /media/{id}/url:
+    get:
+      tags: [media]
+      summary: Get a signed read URL
+      description: |
+        FR-065. Expires in 15 minutes or less. Authorisation is evaluated against
+        the linked entity, not the media row. Signed URLs are never logged.
+      parameters:
+        - $ref: '#/components/parameters/ResourceId'
+        - name: variant
+          in: query
+          schema: { type: string, enum: [original, web, thumb], default: web }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  expires_at: { type: string, format: date-time }
+
+  # ----------------------------------------------------------------- sync ----
+  /sync:
+    post:
+      tags: [sync]
+      summary: Batch mutation replay from an offline client
+      description: |
+        The core write path for field clients. See
+        docs/02-architecture/05-offline-first-and-sync.md.
+
+        Each mutation is applied in its own transaction and reported individually:
+        one bad record must never block a week of queued work. `duplicate` is a
+        success from the client's perspective.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SyncRequest' }
+      responses:
+        '200':
+          description: Processed (possibly partially)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /sync/pull:
+    get:
+      tags: [sync]
+      summary: Pull changes for the client's assigned scope
+      description: |
+        Bounded by design: a field device never mirrors the whole org. Console mode
+        does not use this endpoint.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - name: scope
+          in: query
+          schema: { type: string, enum: [assigned], default: assigned }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncPullResponse' }
+
+  # ---------------------------------------------------------------- audit ----
+  /audit/verify:
+    get:
+      tags: [audit]
+      summary: Verify a segment of the org's audit chain
+      description: FR-105. Reports the first broken link, if any.
+      parameters:
+        - name: from_seq
+          in: query
+          schema: { type: integer, format: int64, default: 1 }
+        - name: to_seq
+          in: query
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditVerification' }
+
+  # ----------------------------------------------------------------- jobs ----
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: Async job status
+      parameters: [{ $ref: '#/components/parameters/ResourceId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous page. Offsets are not supported.
+      schema: { type: string }
+    Bbox:
+      name: bbox
+      in: query
+      description: 'minLon,minLat,maxLon,maxLat — longitude first'
+      schema: { type: string, pattern: '^-?\d+(\.\d+)?(,-?\d+(\.\d+)?){3}$' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Client UUIDv7. A repeat within 24h replays the stored response.
+      schema: { type: string }
+
+  responses:
+    Unauthenticated:
+      description: Missing or expired access token
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but lacking permission
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Absent, or belonging to another org (existence is never revealed)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Illegal state transition, version mismatch, or unique conflict
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: Well-formed but invalid
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PayloadTooLarge:
+      description: Batch or body over limit
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem document — the only error shape this API returns.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail:
+          type: string
+          description: Safe to show a user. Never contains SQL, stack traces or internal ids.
+        instance: { type: string }
+        request_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              code: { type: string }
+              message: { type: string }
+
+    Point:
+      type: object
+      description: GeoJSON Point. Coordinates are [longitude, latitude] — longitude FIRST.
+      required: [type, coordinates]
+      properties:
+        type: { type: string, enum: [Point] }
+        coordinates:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: number }
+          example: [24.8697, 44.8565]
+
+    PageInfo:
+      type: object
+      properties:
+        next_cursor: { type: string, nullable: true }
+        has_more: { type: boolean }
+        limit: { type: integer }
+
+    Cluster:
+      type: object
+      description: Returned instead of features when a viewport exceeds the feature cap.
+      required: [type, coordinates, count]
+      properties:
+        type: { type: string, enum: [cluster] }
+        coordinates:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: number }
+        count: { type: integer }
+        bbox:
+          type: array
+          items: { type: number }
+
+    RegisterRequest:
+      type: object
+      required: [email, password, display_name, org_name]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 12 }
+        display_name: { type: string, minLength: 1 }
+        org_name: { type: string, minLength: 1 }
+        locale: { type: string, enum: [ro, en, de], default: ro }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+
+    AuthTokens:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: Access token lifetime in seconds }
+        active_org_id: { type: string, format: uuid }
+
+    CurrentUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        display_name: { type: string }
+        locale: { type: string }
+        active_org_id: { type: string, format: uuid }
+        memberships:
+          type: array
+          items:
+            type: object
+            properties:
+              org_id: { type: string, format: uuid }
+              org_name: { type: string }
+              role:
+                type: string
+                enum: [owner, admin, coordinator, vet, volunteer, funder]
+        permissions:
+          type: array
+          description: Effective permissions in the active org, so the UI can hide what it cannot do.
+          items: { type: string }
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_label: { type: string, nullable: true }
+        ip_country: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        expires_at: { type: string, format: date-time }
+
+    SightingCreate:
+      type: object
+      required: [id, location, occurred_at, animal_count_estimate]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Client-generated UUIDv7 (ADR-0015).
+        location: { $ref: '#/components/schemas/Point' }
+        location_accuracy_m: { type: integer, minimum: 0 }
+        occurred_at:
+          type: string
+          format: date-time
+          description: Client-observed time. Rejected if more than 24h in the future (FR-035).
+        animal_count_estimate: { type: integer, minimum: 1 }
+        notched_count_observed: { type: integer, minimum: 0, default: 0 }
+        health_note: { type: string }
+        client_created_at: { type: string, format: date-time }
+
+    Sighting:
+      allOf:
+        - $ref: '#/components/schemas/SightingCreate'
+        - type: object
+          properties:
+            status: { type: string, enum: [active, duplicate, rejected] }
+            source: { type: string, enum: [field_app, import, device] }
+            reported_by_user_id:
+              type: string
+              format: uuid
+              nullable: true
+              description: Null for device-originated sightings (Phase 2 seam).
+            clock_skew_ms: { type: integer, nullable: true }
+            created_at: { type: string, format: date-time }
+            pack_ids:
+              type: array
+              items: { type: string, format: uuid }
+            media_ids:
+              type: array
+              items: { type: string, format: uuid }
+
+    SightingList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/Sighting'
+              - $ref: '#/components/schemas/Cluster'
+        page: { $ref: '#/components/schemas/PageInfo' }
+        meta:
+          type: object
+          properties:
+            representation: { type: string, enum: [features, clustered] }
+            feature_cap: { type: integer }
+
+    Pack:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, nullable: true }
+        centroid:
+          allOf: [{ $ref: '#/components/schemas/Point' }]
+          nullable: true
+          description: Omitted entirely for funder identities (FR-031).
+        centroid_is_manual: { type: boolean }
+        locality_id: { type: string, format: uuid, nullable: true }
+        animal_count_estimate: { type: integer, nullable: true }
+        estimate_method:
+          type: string
+          enum: [field_report, max_observed, mean_recent, manual]
+        notched_ratio_observed: { type: number, nullable: true }
+        status: { type: string, enum: [proposed, active, closed] }
+        closed_reason:
+          type: string
+          nullable: true
+          enum: [resolved, relocated, duplicate, erroneous]
+        merged_into_pack_id: { type: string, format: uuid, nullable: true }
+        version: { type: integer }
+        sighting_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PackUpdate:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer, description: Optimistic concurrency check. }
+        name: { type: string }
+        centroid: { $ref: '#/components/schemas/Point' }
+        animal_count_estimate: { type: integer, minimum: 0 }
+
+    PackList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/Pack'
+              - $ref: '#/components/schemas/Cluster'
+        page: { $ref: '#/components/schemas/PageInfo' }
+
+    AnimalCreate:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, format: uuid }
+        microchip:
+          type: string
+          pattern: '^[0-9]{15}$'
+          description: ISO 11784/11785. A 642 prefix indicates Romanian registration.
+        name: { type: string }
+        sex: { type: string, enum: [unknown, male, female], default: unknown }
+        estimated_birth_year: { type: integer }
+        size_class: { type: string }
+        coat_description: { type: string }
+        ear_notch_status:
+          type: string
+          enum: [unknown, none, left, right, both]
+          default: unknown
+        is_owned: { type: boolean, default: false }
+        household_ref:
+          type: string
+          description: Free label only. MUST NOT contain owner personal data (FR-057).
+        pack_id: { type: string, format: uuid }
+
+    Animal:
+      allOf:
+        - $ref: '#/components/schemas/AnimalCreate'
+        - type: object
+          properties:
+            is_romanian_chip: { type: boolean, nullable: true }
+            sterilisation_status:
+              type: string
+              enum: [unknown, reported_sterilised, confirmed_sterilised, not_sterilised]
+              description: Derived from interventions. Never settable directly (FR-058).
+            chip_lookup_provider: { type: string, nullable: true }
+            chip_lookup_found: { type: boolean, nullable: true }
+            chip_lookup_checked_at: { type: string, format: date-time, nullable: true }
+            created_at: { type: string, format: date-time }
+
+    AnimalList:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Animal' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+
+    MediaPresign:
+      type: object
+      properties:
+        media_id: { type: string, format: uuid }
+        upload_url: { type: string, format: uri }
+        expires_at: { type: string, format: date-time }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+
+    Media:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        variant: { type: string, enum: [original, web, thumb] }
+        content_type: { type: string }
+        byte_size: { type: integer }
+        sha256: { type: string, nullable: true }
+        width: { type: integer, nullable: true }
+        height: { type: integer, nullable: true }
+        captured_at: { type: string, format: date-time, nullable: true }
+        status:
+          type: string
+          enum: [pending, uploaded, processed, quarantined, failed]
+        uploaded_by_user_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    SyncMutation:
+      type: object
+      required: [op_id, type, entity_id, payload]
+      properties:
+        op_id:
+          type: string
+          format: uuid
+          description: Generated once at enqueue, never regenerated on retry.
+        type:
+          type: string
+          enum:
+            - sighting.create
+            - animal.create
+            - animal.update
+            - intervention.create
+            - intervention.correct
+            - mission_stop.outcome
+            - media.link
+        entity_id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        payload: { type: object, additionalProperties: true }
+
+    SyncRequest:
+      type: object
+      required: [client_id, client_version, mutations]
+      properties:
+        client_id: { type: string, format: uuid }
+        client_version: { type: string }
+        device_clock_at:
+          type: string
+          format: date-time
+          description: Used to compute skew. Never trusted for ordering (NFR-018).
+        last_pull_cursor: { type: string }
+        mutations:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/SyncMutation' }
+
+    SyncResult:
+      type: object
+      required: [op_id, status]
+      properties:
+        op_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [applied, duplicate, rejected]
+          description: |
+            `duplicate` is a success — remove it from the outbox.
+            `rejected` is terminal — surface it, do not retry forever.
+        entity_id: { type: string, format: uuid }
+        server_created_at: { type: string, format: date-time }
+        problem: { $ref: '#/components/schemas/Problem' }
+
+    SyncResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/SyncResult' }
+        server_time: { type: string, format: date-time }
+        clock_skew_ms: { type: integer }
+        pull_cursor: { type: string }
+
+    SyncPullResponse:
+      type: object
+      properties:
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              entity_type: { type: string }
+              entity_id: { type: string, format: uuid }
+              op: { type: string, enum: [upsert, delete] }
+              data: { type: object, additionalProperties: true }
+              seq: { type: integer, format: int64 }
+        next_cursor: { type: string }
+        has_more: { type: boolean }
+
+    AuditVerification:
+      type: object
+      properties:
+        org_id: { type: string, format: uuid }
+        range:
+          type: object
+          properties:
+            from_seq: { type: integer, format: int64 }
+            to_seq: { type: integer, format: int64 }
+        verified: { type: boolean }
+        head_hash: { type: string }
+        checked_at: { type: string, format: date-time }
+        first_broken_seq:
+          type: integer
+          format: int64
+          nullable: true
+
+    Job:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        poll_after_ms: { type: integer }
+        result_url: { type: string, format: uri, nullable: true }
+        problem: { $ref: '#/components/schemas/Problem' }
+
+# Declared here so agents know these paths are reserved and specified by their
+# backlog items before implementation. Do not invent shapes for them ad hoc.
+x-planned-endpoints:
+  m3-missions:
+    - GET|POST /missions
+    - GET|PATCH /missions/{id}
+    - POST /missions/{id}/optimise        # 202 + job_id (FR-073)
+    - POST /missions/{id}/status          # enforced transitions (FR-083)
+    - PATCH /missions/{id}/stops/order    # manual reorder (FR-076)
+    - POST /missions/{id}/stops/{stopId}/outcome
+    - POST /missions/{id}/cache-bundle    # offline execution payload (FR-077)
+    - GET|POST /vehicles
+  m4-evidence-and-reporting:
+    - GET|POST /interventions
+    - POST /interventions/{id}/correct    # supersede, never edit (FR-093)
+    - POST /animals/{id}/chip-lookup      # 202, best effort (FR-054)
+    - GET|POST /campaigns
+    - GET|POST /grants
+    - POST /reports                       # 202 + job_id (FR-113)
+    - GET /reports/{id}
+    - POST /exports/recs-csv              # FR-056
+    - GET /metrics/campaign/{id}          # FR-112, includes freshness
+  m5-compliance:
+    - POST /admin/dsr/export              # FR-120
+    - POST /admin/dsr/erase               # FR-121

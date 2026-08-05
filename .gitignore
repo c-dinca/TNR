@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!contracts/**/*.key
+
+# Test and coverage
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Local infrastructure state and data
+infra/**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+volumes/
+data/
+*.osm.pbf
+*.osrm*
+*.pmtiles
+
+# Local database dumps — never commit real animal-welfare data
+*.dump
+*.sql.gz
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
